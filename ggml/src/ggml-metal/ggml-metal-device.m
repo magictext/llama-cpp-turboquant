@@ -224,6 +224,15 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                 [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
 #endif
 
+                // TurboQuant: use bit-arithmetic dequant on pre-M5 hardware
+                // where constant cache thrashing causes 10x decode slowdown.
+                // Bit-arithmetic uses pure ALU (zero memory access) at ~3% ALU cost.
+                // On M5+ with efficient constant cache, use the default LUT path.
+                if (!ggml_metal_device_get_props(dev)->has_tensor) {
+                    [prep setObject:@"1" forKey:@"TURBO_DEQUANT_BITMATH"];
+                    GGML_LOG_INFO("%s: turbo3 using bit-arithmetic dequant (no tensor API)\n", __func__);
+                }
+
                 MTLCompileOptions * options = [MTLCompileOptions new];
                 options.preprocessorMacros = prep;
 

@@ -621,35 +621,51 @@ void dequantize_turbo3_0(device const block_turbo3_0 * xb, short il, thread type
     reg = (type4x4) reg_f;
 }
 
-// Half-precision centroid LUT for vec path — reduces constant cache pressure at long context.
-// Register LUT (cn[8] = centroid*norm in thread registers) was tested but caused register
-// spill on Metal, making it slower. Constant half LUT + float norm broadcast remains the
-// fastest approach on Apple Silicon. On CUDA, register LUT works better (see @spiritbuun).
+// Half-precision centroid LUT for vec path (Method A: constant memory)
 constant half turbo_centroids_3bit_h[8] = {
     -0.190685h, -0.117832h, -0.065717h, -0.021460h,
      0.021460h,  0.065717h,  0.117832h,  0.190685h
 };
 
-// Vec: 4 elements per call (il ∈ {0..7}), returns type4
-// Register centroid×norm LUT — ported from @spiritbuun's CUDA implementation.
-// Precompute centroid[i]*norm into thread-local registers once per block,
-// then index into registers instead of hitting constant memory per element.
-// On CUDA this gave 96-97% decode speed vs q8_0 (up from ~88%).
+// Bit-arithmetic constants for Method B (zero memory access)
+constant float TURBO_M0 = 0.021460f;
+constant float TURBO_D1 = 0.044257f;  // m1 - m0
+constant float TURBO_D2 = 0.096372f;  // m2 - m0
+constant float TURBO_D3 = 0.028596f;  // m3 - m0 - d1 - d2
+
+inline float turbo_centroid_from_bits(uint8_t qs_2bit, uint8_t sign_bit) {
+    const uint8_t mag = sign_bit ? qs_2bit : (3 - qs_2bit);
+    const float b0 = float(mag & 1);
+    const float b1 = float((mag >> 1) & 1);
+    const float magv = TURBO_M0 + b0 * TURBO_D1 + b1 * TURBO_D2 + (b0 * b1) * TURBO_D3;
+    return sign_bit ? magv : -magv;
+}
+
+// Vec dequant: compile-time switch between two methods.
+// TURBO_DEQUANT_BITMATH=1: pure ALU, zero memory (best for M1/M2 constant cache thrashing)
+// TURBO_DEQUANT_BITMATH=0: constant half[8] LUT (best for M5+ with efficient constant cache)
+// Build with: cmake -DTURBO_DEQUANT_BITMATH=1 to test bit-arithmetic path.
+#ifndef TURBO_DEQUANT_BITMATH
+#define TURBO_DEQUANT_BITMATH 0
+#endif
+
 template <typename type4>
 void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
     const float norm = float(xb->norm);
-
-    // Original 8-entry constant half LUT + float norm broadcast.
-    // Register LUT approach (cn[8] array) tested but caused register spill
-    // on Metal, making it slower than constant memory. Reverting to the
-    // proven approach from main branch: constant half LUT + float multiply.
-    // This is the fastest vec dequant on M5 Max (77.4 tok/s).
-    // Note: @spiritbuun's register LUT works great on CUDA (96-97% of q8_0)
-    // but Metal's register file handles it differently.
     const uint8_t qb = xb->qs[il];
     const uint8_t sb = xb->signs[il >> 1];
     const int sshift = (il & 1) << 2;
 
+#if TURBO_DEQUANT_BITMATH
+    // Method B: bit-arithmetic (zero memory access, pure ALU)
+    reg = type4(float4(
+        turbo_centroid_from_bits((qb      ) & 0x03, (sb >> (sshift + 0)) & 1) * norm,
+        turbo_centroid_from_bits((qb >> 2) & 0x03, (sb >> (sshift + 1)) & 1) * norm,
+        turbo_centroid_from_bits((qb >> 4) & 0x03, (sb >> (sshift + 2)) & 1) * norm,
+        turbo_centroid_from_bits((qb >> 6) & 0x03, (sb >> (sshift + 3)) & 1) * norm
+    ));
+#else
+    // Method A: constant half[8] LUT + float norm broadcast (default)
     float4 centroids = float4(half4(
         turbo_centroids_3bit_h[(qb & 0x03)        | (((sb >> (sshift + 0)) & 1) << 2)],
         turbo_centroids_3bit_h[((qb >> 2) & 0x03) | (((sb >> (sshift + 1)) & 1) << 2)],
@@ -657,6 +673,7 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
         turbo_centroids_3bit_h[((qb >> 6) & 0x03) | (((sb >> (sshift + 3)) & 1) << 2)]
     ));
     reg = type4(centroids * norm);
+#endif
 }
 
 // ----- turbo4 dequantize with per-thread block cache -----
