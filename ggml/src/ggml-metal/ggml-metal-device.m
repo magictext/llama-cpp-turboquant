@@ -254,6 +254,17 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                     // at dispatch time in ggml_metal_op_flash_attn_ext()
                 }
 
+                // SMEM pre-dequant: move centroid LUT reads out of FA inner loop
+                // into threadgroup memory. Opt-in via TURBO_SMEM_DEQUANT=1 env var.
+                // Only beneficial on pre-M5 hardware where constant cache divergence is expensive.
+                {
+                    const char * smem_dq = getenv("TURBO_SMEM_DEQUANT");
+                    if (smem_dq && smem_dq[0] == '1') {
+                        [prep setObject:@"1" forKey:@"TURBO_USE_SMEM_DEQUANT"];
+                        GGML_LOG_INFO("%s: turbo3/4 SMEM pre-dequant enabled\n", __func__);
+                    }
+                }
+
                 // TurboQuant profiling: set TURBO_PROFILE_MODE env var (0-4)
                 {
                     const char * pm = getenv("TURBO_PROFILE_MODE");

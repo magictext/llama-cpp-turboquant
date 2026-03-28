@@ -2959,6 +2959,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // note: for simplicity assume the K is larger or equal than V
         GGML_ASSERT(ne10 >= ne20);
 
+        // Check if SMEM pre-dequant is enabled (matches Metal compile-time flag)
+        const char * smem_dq_env = getenv("TURBO_SMEM_DEQUANT");
+        const bool turbo_smem_dequant = smem_dq_env && smem_dq_env[0] == '1';
+
         // ne00 + 2*ncpsg*(nsg)
         // for each query, we load it as f16 in shared memory (ne00)
         // and store the soft_max values and the mask
@@ -2967,7 +2971,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // each simdgroup has a full f32 head vector in shared mem to accumulate results
         //
 // Extra 128 floats (512 bytes) for TurboQuant pre-dequantized block cache in threadgroup memory
-#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2) + 128*sizeof(float), 16))
+// SMEM pre-dequant: if TURBO_SMEM_DEQUANT=1, add C * max(DK, DV) * sizeof(half) for pre-dequant buffer
+// This is ncpsg * max(ne00, ne20) * 2 bytes (half precision).
+#define FATTN_SMEM_DEQUANT_EXTRA (turbo_smem_dequant ? (ncpsg * (ne00 > ne20 ? ne00 : ne20) * sizeof(uint16_t)) : 0)
+#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2) + 128*sizeof(float) + FATTN_SMEM_DEQUANT_EXTRA, 16))
 
         int64_t nsg = 1;
 
@@ -3085,6 +3092,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 #undef FATTN_SMEM
+#undef FATTN_SMEM_DEQUANT_EXTRA
     }
 
     return 1;

@@ -677,6 +677,10 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
 #define TURBO_PROFILE_MODE 0
 #endif
 
+#ifndef TURBO_USE_SMEM_DEQUANT
+#define TURBO_USE_SMEM_DEQUANT 0
+#endif
+
 #if TURBO_PROFILE_MODE == 1
     // NO-OP: decode speed ceiling
     reg = type4(0.0f);
@@ -7068,6 +7072,16 @@ kernel void kernel_flash_attn_ext_vec(
     threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NSG*PK); // scratch buffer for mask
     threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + NSG*PK + NSG*SH); // scratch buffer for the results
 
+#if TURBO_USE_SMEM_DEQUANT
+    // SMEM pre-dequant buffer: C * max(DK4, DV4) half4 values.
+    // Pre-dequantize an entire tile of K or V data into threadgroup memory
+    // BEFORE the dot product loop, eliminating constant LUT reads from the hot path.
+    // Reused between K and V phases (they don't overlap).
+    // Layout: smem_dq[cc * max(DK4,DV4) + i] = dequantized half4 for cache pos cc, element i
+    constexpr short SMEM_DQ_STRIDE = DK4 > DV4 ? DK4 : DV4;
+    threadgroup half4 * smem_dq = (threadgroup half4 *) (shmem_f16 + NSG*PK + NSG*SH + 2*NSG*PV);
+#endif
+
     // store the result for all queries in shared memory (the O matrix from the paper)
     so4 += tiisg;
 
@@ -7172,6 +7186,31 @@ kernel void kernel_flash_attn_ext_vec(
                 continue;
             }
 
+#if TURBO_USE_SMEM_DEQUANT
+            // ---- SMEM PRE-DEQUANT PHASE (K) ----
+            // All threads cooperatively dequant C cache positions × DK4 float4s
+            // into threadgroup memory. This moves ALL constant LUT reads out of
+            // the Q*K^T dot product loop.
+            //
+            // With NE=1: 32 threads, 32 cache positions, DK4 elements each.
+            // Thread tiisg pre-dequants cache position tiisg (all DK4 float4s).
+            if (!is_same<kd4_t, k4_t>::value) {
+                // Only for quantized types (turbo3/turbo4/q8_0/etc.)
+                // Each thread dequants one full cache position's K vector.
+                // tiisg maps to cache position cc=tiisg (for NE=1, all 32 threads have unique cc).
+                const short my_cc = tiisg;  // each thread owns one cache position
+                device const kd4_t * pk_dq = (device const kd4_t *) (k + ((ic + my_cc)*args.nb11));
+
+                for (short i = 0; i < DK4; ++i) {
+                    k4_t mk;
+                    deq_k_t4(pk_dq + i/nl_k, i%nl_k, mk);
+                    smem_dq[my_cc * DK4 + i] = (half4) mk;
+                }
+
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+#endif
+
             // Q*K^T
             {
                 device      const k4_t * pk4 = (device const k4_t *) (k + ic*args.nb11);
@@ -7189,9 +7228,17 @@ kernel void kernel_flash_attn_ext_vec(
                             mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
                         }
                     } else {
+#if TURBO_USE_SMEM_DEQUANT
+                        // SMEM PRE-DEQUANT: read from pre-dequantized threadgroup memory.
+                        // The constant LUT reads happened during the pre-dequant phase (before this loop).
+                        // Now the dot product only reads from fast threadgroup memory — zero constant pressure.
+                        // Cache position in SMEM: NE*cc + ty (same mapping as device memory access)
+                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                            const short i = ii*NL + tx;
+                            mqk[cc] += dot((float4) smem_dq[(NE*cc + ty) * DK4 + i], (float4) sq4[i]);
+                        }
+#elif TURBO_USE_4MAG && TURBO_FUSED_BLOCK_DOT
                         device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
-
-#if TURBO_USE_4MAG && TURBO_FUSED_BLOCK_DOT
                         // FUSED BLOCK DOT: flip computation order.
                         // Instead of per-element: score += centroid[idx] * norm * Q[j]
                         // Do per-centroid: score += mag[c] * norm * sum(Q[j] where mi[j]==c)
@@ -7256,6 +7303,7 @@ kernel void kernel_flash_attn_ext_vec(
                         // This eliminates BOTH constant memory AND branches from the inner loop.
                         // The shuffle is a single-cycle cross-lane operation.
 #else
+                        device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
                         k4_t mk;
 
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
@@ -7347,6 +7395,24 @@ kernel void kernel_flash_attn_ext_vec(
 
             // O = O + (Q*K^T)*V
             {
+#if TURBO_USE_SMEM_DEQUANT
+                // ---- SMEM PRE-DEQUANT PHASE (V) ----
+                // Reuse smem_dq buffer (K phase is done). Pre-dequant all C cache positions' V data.
+                // Same cooperative pattern as K: thread tiisg pre-dequants one cache position.
+                if (!is_same<vd4_t, v4_t>::value) {
+                    const short my_cc = tiisg;
+                    device const vd4_t * pv_dq = (device const vd4_t *) (v + ((ic + my_cc)*args.nb21));
+
+                    for (short i = 0; i < DV4; ++i) {
+                        v4_t mv;
+                        deq_v_t4(pv_dq + i/nl_v, i%nl_v, mv);
+                        smem_dq[my_cc * DV4 + i] = (half4) mv;
+                    }
+
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                }
+#endif
+
                 o4_t lo[DV4/NL];
                 FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
                     lo[ii] = 0.0f;
@@ -7366,13 +7432,20 @@ kernel void kernel_flash_attn_ext_vec(
                     }
                 } else {
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-#if TURBO_SPARSE_V
+#if TURBO_USE_SMEM_DEQUANT
+                        // SMEM PRE-DEQUANT: read V from threadgroup memory.
+                        // Cache position in SMEM: NE*cc + ty (same mapping as device memory access)
+                        FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                            const short i = ii*NL + tx;
+                            lo[ii] += o4_t(float4(smem_dq[(NE*cc + ty) * DV4 + i])*float4(ss[NE*cc + ty]));
+                        }
+#elif TURBO_SPARSE_V
                         // SPARSE V DEQUANT: skip V for positions with negligible attention weight.
                         // At 32K context, ~90%+ of attention weights are near zero.
                         // Skipping their V dequant saves ~50% of total dequant cost.
                         const float attn_weight = float(ss[NE*cc + ty]);
                         if (attn_weight < 1e-6f) continue;  // skip negligible positions
-#endif
+
                         device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
 
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
@@ -7383,6 +7456,18 @@ kernel void kernel_flash_attn_ext_vec(
 
                             lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
                         }
+#else
+                        device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
+
+                        FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                            const short i = ii*NL + tx;
+
+                            v4_t mv;
+                            deq_v_t4(pv4 + i/nl_v, i%nl_v, mv);
+
+                            lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
+                        }
+#endif
                     }
                 }
 
